@@ -1,0 +1,31 @@
+# virtual environment
+/kaddvenv
+
+# data (bulk DICOM tree + CSVs — competition data must not be redistributed)
+/data/**
+
+# training outputs
+/output/**
+
+# local scratch/scratchpad (probe runs, pulled kernel outputs, precomputed
+# volumes, checkpoints — large local artifacts, never repo content)
+/.scratch/**
+
+# python
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# OS
+.DS_Store
+._*
+
+CLAUDE.md
+
+# Kaggle credentials, if kept project-local instead of ~/.kaggle
+/.kaggle/
+
+# Anthropic API key, if kept project-local instead of an exported env var
+/.anthropic/

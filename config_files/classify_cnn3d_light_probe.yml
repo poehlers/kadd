@@ -1,0 +1,54 @@
+name: classify_cnn3d_light_probe
+# TEMPORARY, 2026-08-27: NOT the real light-tier training config (that's
+# classify_cnn3d_light.yml, untouched, already validated at 0.7095 macro-AUC
+# — see CLAUDE.md sec 7). This exists purely to get a fair, apples-to-apples
+# resource/speed comparison against the cnn3d/medium 3-epoch probe
+# (classify_cnn3d_medium.yml) under IDENTICAL settings (batch_size=2,
+# max_series=8, sub_epoch_size=300, epochs=3) and IDENTICAL current code —
+# the medium probe's GPU-compute reading looked suspiciously faster than an
+# old cnn3d/light measurement from 8 days ago (kernel v21), but that old
+# number was that kernel's very first epoch (likely inflated by one-time
+# CUDA/cuDNN warm-up) under since-changed code — not a fair baseline. This
+# probe removes that confound by comparing both tiers under today's code,
+# back to back.
+
+classify:
+  model:
+    type: cnn3d
+    size: light
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    sub_epoch_size: 300
+    precomputed_dir: data/precomputed
+    max_series: 8
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 3
+    batch_size: 2
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 4
+    grad_clip: 1.0
+    patience: 20

@@ -1,0 +1,30 @@
+This project adapts code from poehlers/DenPIE (https://github.com/poehlers/DenPIE),
+a cosmological simulation-based-inference toolkit by the same author, used as this
+project's quality/structure bar (see CLAUDE.md sec 4). All source referenced below
+was fetched directly from the GitHub repository at the commit current when read
+(not reconstructed from memory).
+
+- kadd/classify/model.py — Swin3DSeriesEncoder is adapted from
+  den_pie/density/encoder.py's Swin3DEncoder (torchvision Swin3D wrapper: stem
+  conv replaced for single-channel input, head replaced with a projection,
+  gradient checkpointing). CNN3DSeriesEncoder is adapted from the same file's
+  ConvNet3DDensity (conv blocks -> global average pool -> linear projection);
+  DenPIE's original fixed 1->32->64->128->256 config is preserved unchanged as
+  this project's cnn3d 'light' size tier.
+- kadd/classify/train.py — ClassifierTraining is adapted from
+  den_pie/density/train.py's DensityTraining (config-driven optimizer/scheduler,
+  gradient accumulation + clipping, EMA-tracked early stopping, atomic checkpoint
+  saves, loss-curve plotting).
+- kadd/classify/data.py — the lazy per-sample dataset + train-split-only
+  normalization pattern is adapted from den_pie/density/data.py's
+  FLIDatasetLazy/FLIDataLoader.
+- kadd/util/logger.py, kadd/util/parse.py — ported near-verbatim from
+  den_pie/util/logger.py and den_pie/util/parse.py (run-directory convention,
+  YAML config parsing, logging setup).
+- kadd/__main__.py — CLI shape (`python -m <pkg> <verb>-train <config.yml>`)
+  follows den_pie/__main__.py.
+
+Deviations from DenPIE (clinical MRI vs. periodic cosmological density fields,
+attention-MIL pooling over a variable series-per-study bag, DICOM-specific
+loading/windowing, multi-GPU study-sharded training) are documented inline in
+each adapted file's module docstring, not repeated here.

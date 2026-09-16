@@ -1,0 +1,19 @@
+{
+  "id": "pieteroehlers/kadd-precompute-volumes",
+  "title": "kadd precompute-volumes",
+  "code_file": "precompute_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [
+    "pieteroehlers/kadd-package",
+    "pieteroehlers/kadd-precomputed-volumes"
+  ],
+  "competition_sources": [
+    "rsna-knee-abnormality-detection"
+  ],
+  "kernel_sources": []
+}

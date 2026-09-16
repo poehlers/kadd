@@ -1,0 +1,120 @@
+name: classify_cnn3d_light_earlymeta
+# ABLATION, 2026-08-21: identical to classify_cnn3d_light.yml (the config
+# that produced kernel v29's real result — 56 epochs, best macro-AUC 0.7095,
+# see CLAUDE.md sec 7) in every respect EXCEPT one line: meta_fusion: early
+# (added under classify.model below) instead of the implicit default 'late'.
+#
+# Question being tested: does giving the encoder plane/fluid-sensitivity/
+# fat-suppression metadata AT THE INPUT (broadcast as extra spatially-
+# constant channels, every layer conditions on it from the start — see
+# kadd/classify/model.py's _broadcast_meta_channels and KneeClassifier
+# docstring) beat the original design, where that same metadata is only
+# added AFTER the encoder has already produced its embedding (SeriesMetaEmbed,
+# 'late' fusion — what v29 used)? Raised by the user after asking whether
+# series get distinct input channels at all (they don't, currently) and
+# whether that limits the model's ability to distinguish series types from
+# the very first layer.
+#
+# Not a registration concern: 'early' fusion never stacks DIFFERENT series
+# together — each series only ever gets its OWN metadata broadcast onto its
+# OWN coordinate grid, so no cross-series spatial alignment is needed.
+#
+# Deliberately NOT combining both fusion modes (early diagnostics some,
+# SeriesMetaEmbed elsewhere) — this is a clean either/or ablation against the
+# known 0.7095 baseline, not a "give it more of both" change, so any AUC
+# difference is attributable to WHEN metadata is injected, not how much.
+#
+# Every other value below (data setup, batch_size, num_workers, everything)
+# is copied verbatim from classify_cnn3d_light.yml, including its historical
+# tuning comments — those measurements were about GPU/data-loading behavior,
+# unaffected by meta_fusion, and still describe why these particular values
+# were chosen.
+#
+# ---- verbatim copy of classify_cnn3d_light.yml's original header follows ----
+#
+# cnn3d encoder, size=light — this is DenPIE's ORIGINAL ConvNet3DDensity config
+# unchanged (channels 1->32->64->128->256, see kadd/classify/model.py
+# CNN3D_CHANNELS). Same data setup as the swin3d v2/light config (silver
+# labels, gold held out as val).
+#
+# use_checkpointing is on even though DenPIE's default left it off (plain
+# Conv3d's first block runs densely at near-full resolution, no windowing to
+# bound its memory the way Swin's attention has).
+#
+# FIRST REAL MEASUREMENT for this tier, 2026-08-19 (epoch 1 of the full-
+# dataset/precomputed-volumes run, kernel version 21, batch_size=4,
+# max_series=8, num_workers=4, no prefetch_factor override):
+#   GPU 0: peak_allocated=1.20GB reserved=2.50GB / 15.64GB (8%)
+#   GPU 1: peak_allocated=1.01GB reserved=3.22GB / 15.64GB (6%)
+#   Data loading: 153.4s  GPU compute: 139.0s  (52% of step time on data)
+#   CPU: 77% avg across 4 logical cores (num_workers=4, no oversubscription)
+#   Host RAM: 5.18GB used / 33.66GB total (24%), 25.41GB available
+#
+# num_workers=8/prefetch_factor=4 WAS TRIED (kernel version 22, 2026-08-19)
+# and OOM-killed the host within ~2 minutes. Reverted num_workers/
+# prefetch_factor back to the known-safe 4/default.
+#
+# KERNEL VERSION 23 (num_workers=4, batch_size=16/max_series=14) ran 3 clean
+# epochs, confirming num_workers/prefetch_factor was indeed the OOM cause.
+# GPU reserved settles to ~26-42% steady-state; num_workers nudged 4->6.
+#
+# KERNEL VERSION 24 (num_workers=6, batch_size=16): 59 clean epochs, peak_
+# allocated only 26%/23% — real headroom, batch_size raised 16->24.
+#
+# KERNEL VERSION 25 (batch_size=24 on top of num_workers=6): OOM-killed the
+# HOST (not GPU — GPU was fine at 37-40%/33-35%) after epoch 2. Root cause:
+# num_workers*prefetch_factor multiplies the prefetch queue's memory
+# footprint, and that queue holds whole BATCHES — a bigger batch_size
+# directly multiplies it. num_workers reverted 6->4 (validated safe), batch_
+# size=24 kept (GPU-side, never implicated).
+#
+# KERNEL VERSION 29 (num_workers=4, batch_size=24, meta_fusion='late'
+# implicitly): the real successful run this ablation is tested against —
+# 56 epochs, early-stopped, best macro-AUC 0.7095.
+
+classify:
+  model:
+    type: cnn3d
+    size: light                # xlight | light | medium | large
+    summary_dim: 256
+    meta_dim: 16                # unused when meta_fusion=early (SeriesMetaEmbed isn't built), kept
+                                 #   for config-shape consistency with classify_cnn3d_light.yml
+    use_checkpointing: true
+    meta_fusion: early           # THE ABLATION — see file header. 'late' (SeriesMetaEmbed, post-encoder
+                                  #   additive) is what kernel v29 used to reach 0.7095; this run tests
+                                  #   'early' (metadata broadcast as extra input channels, pre-encoder)
+                                  #   against that same baseline, everything else held constant.
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    # No sub_epoch_size cap — matches v29 exactly (full ~4,349-study silver
+    # set every epoch). See classify_cnn3d_light.yml for the full reasoning.
+    precomputed_dir: data/precomputed
+    max_series: 14
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 100
+    batch_size: 24
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 2
+    grad_clip: 1.0
+    patience: 20

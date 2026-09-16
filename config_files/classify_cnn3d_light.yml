@@ -1,0 +1,145 @@
+name: classify_cnn3d_light
+# cnn3d encoder, size=light — this is DenPIE's ORIGINAL ConvNet3DDensity config
+# unchanged (channels 1->32->64->128->256, see kadd/classify/model.py
+# CNN3D_CHANNELS). Same data setup as the swin3d v2/light config (silver
+# labels, gold held out as val).
+#
+# use_checkpointing is on even though DenPIE's default left it off (plain
+# Conv3d's first block runs densely at near-full resolution, no windowing to
+# bound its memory the way Swin's attention has).
+#
+# FIRST REAL MEASUREMENT for this tier, 2026-08-19 (epoch 1 of the full-
+# dataset/precomputed-volumes run, kernel version 21, batch_size=4,
+# max_series=8, num_workers=4, no prefetch_factor override):
+#   GPU 0: peak_allocated=1.20GB reserved=2.50GB / 15.64GB (8%)
+#   GPU 1: peak_allocated=1.01GB reserved=3.22GB / 15.64GB (6%)
+#   Data loading: 153.4s  GPU compute: 139.0s  (52% of step time on data)
+#   CPU: 77% avg across 4 logical cores (num_workers=4, no oversubscription)
+#   Host RAM: 5.18GB used / 33.66GB total (24%), 25.41GB available
+# Two things this measurement changes vs. earlier tuning done under raw-DICOM
+# decode:
+#   1. GPU is barely touched (6-8%) — huge headroom, batch_size raised below.
+#   2. Host RAM has ~25GB headroom, a completely different situation from the
+#      RAM-crisis runs that forced num_workers down to 4 (matching physical
+#      cores) under raw DICOM decode. A precomputed .npy load is a ~3MB
+#      float16 read, not a multi-step DICOM decode/crop/resize holding large
+#      intermediate arrays — so oversubscribing workers again is safe to
+#      retry now; num_workers/prefetch_factor raised below accordingly.
+# Data loading is still 52% of step time (down from 96% pre-precompute, but
+# not zero) — CPU at 77% (not pegged) alongside that suggests some room left
+# before workers themselves become the limit, worth re-checking after this
+# change lands in a real log rather than assumed fixed.
+#
+# num_workers=8/prefetch_factor=4 WAS TRIED (kernel version 22, 2026-08-19)
+# and OOM-killed the host within ~2 minutes (bare "Killed" in the log, no
+# Python traceback, before any epoch even completed — same OS-OOM-killer
+# signature as the earlier documented host-RAM crashes in this project).
+# Reverted num_workers/prefetch_factor back to the known-safe 4/default —
+# the "abundant RAM headroom" reasoning above turned out to not survive
+# actually combining oversubscription with batch_size=16/max_series=14 in
+# the same step (a real lesson, not just theory: multiple simultaneous
+# changes made it impossible to isolate which one caused the OOM, so THIS
+# revert only touches num_workers/prefetch_factor, keeping batch_size=16/
+# max_series=14 — the GPU-side changes — un-reverted, since those weren't
+# implicated and are a different resource).
+#
+# KERNEL VERSION 23 (num_workers=4, batch_size=16/max_series=14) ran 3 clean
+# epochs before being cancelled by hand, confirming num_workers/
+# prefetch_factor was indeed the OOM cause, not batch_size/max_series. Real
+# 3-epoch trend, worth recording:
+#   epoch 1: 353.2s total, data=174.4s/compute=117.4s (60% data), GPU0
+#            reserved 13.36GB(85%) — a one-time allocator warm-up spike, NOT
+#            steady state (see next two epochs); host RAM 5.51GB (50%)
+#   epoch 2: 307.6s, data=186.6s/compute=111.0s (63% data), GPU0 reserved
+#            5.79GB(37%); host RAM 6.37GB (52%)
+#   epoch 3: 398.7s, data=280.4s/compute=108.8s (72% data), GPU0 reserved
+#            6.54GB(42%); host RAM 6.20GB (52%)
+# Two real conclusions from this, superseding the epoch-1-only read:
+#   1. GPU reserved settles to ~26-42% steady-state, not 82-85% — there is
+#      real headroom here after all, epoch 1 was misleading on its own.
+#   2. Data-wait share is RISING (60%->63%->72%) while CPU utilization is
+#      FALLING (79%->77%->58%) — workers idling more, not working harder.
+#      That's the signature of I/O latency getting worse over the run
+#      (possibly Kaggle storage throttling under sustained load), not a
+#      worker-count/compute ceiling. Host RAM stayed flat all 3 epochs
+#      (50-52%, no leak) — a real steady-state reading, unlike the single
+#      noisy epoch-1 snapshot that drove the (too cautious) num_workers
+#      revert reasoning above. That flat, healthy 3-epoch RAM trend is why
+#      num_workers is being nudged up again below — moderately (4->6, not
+#      back to 8) and alone (prefetch_factor untouched this time), so a
+#      repeat failure or a fix can be attributed to this one variable.
+
+classify:
+  model:
+    type: cnn3d
+    size: light                # xlight | light | medium | large
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    # No sub_epoch_size cap here on purpose: this config trains on the FULL
+    # ~4,349-study silver set every epoch, not a random subset. That was
+    # only safe to do once the CLAUDE.md sec 7 precompute pipeline finished
+    # covering the entire dataset (24,371/24,371 series, confirmed
+    # 2026-08-19) — sub_epoch_size existed specifically because re-decoding raw
+    # DICOM from scratch every epoch made full-dataset epochs take
+    # 75-90+ min each; precomputed_dir below skips that decode for every
+    # series precompute covered (i.e. all of them), so the full dataset is
+    # now cheap per-epoch instead of the bottleneck sub_epoch_size was built to
+    # avoid. See kadd/classify/data.py's precomputed-volume read path.
+    precomputed_dir: data/precomputed
+    max_series: 14                 # raised from 8 (the prior unverified starting point) to the real
+                                    #   per-study ceiling observed anywhere in this project — now
+                                    #   justified for this tier by the real 6-8% GPU measurement above
+                                    #   (see file header), removes this tier's random series subsampling
+                                    #   for the small tail of studies with >8 series (mean is 5.53, so
+                                    #   most studies were already unaffected by the old cap)
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4                  # REVERTED 6->4, 2026-08-20 (kernel version 25) — real lesson:
+                                     #   num_workers=6 was only ever validated at batch_size=16 (kernel
+                                     #   version 24, 59 clean epochs). Bumping batch_size 16->24 on TOP of
+                                     #   that (kernel version 25) OOM-killed the host after epoch 2 (bare
+                                     #   "Killed", host RAM climbing 66%->72% across just 2 epochs — GPU
+                                     #   was fine, 37-40%/33-35%). Root cause: num_workers and batch_size
+                                     #   are NOT independent for host RAM — PyTorch prefetches
+                                     #   num_workers*prefetch_factor whole BATCHES ahead (12 batches at
+                                     #   num_workers=6/default prefetch_factor=2), so a bigger batch_size
+                                     #   directly multiplies the prefetch queue's memory footprint. Back to
+                                     #   4 (validated safe across many runs, well before any host-RAM
+                                     #   incident) so batch_size=24 alone can be isolated and confirmed.
+    # prefetch_factor intentionally left unset (defaults to PyTorch's 2) — see file header.
+
+  train:
+    epochs: 100
+    batch_size: 24                  # 16->24 (1.5x): kernel version 24's completed 59-epoch run
+                                     #   (num_workers=6, batch_size=16) measured peak_allocated at only
+                                     #   26%/23% of each T4's 15.64GB — real, requested headroom to use.
+                                     #   GPU-side this is confirmed fine (kernel version 25 hit 37-40%/
+                                     #   33-35% peak_allocated before dying, comfortably safe). The actual
+                                     #   version-25 failure was host RAM, caused by num_workers=6 (now
+                                     #   reverted to 4 above) — see the num_workers comment for the real
+                                     #   mechanism. batch_size=24 itself was never the problem.
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 2  # unchanged — effective batch grows 8->32 alongside batch_size,
+                                     #   same pattern as prior batch_size bumps in this project
+    grad_clip: 1.0
+    patience: 20

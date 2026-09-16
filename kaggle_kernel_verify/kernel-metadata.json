@@ -1,0 +1,14 @@
+{
+  "id": "pieteroehlers/kadd-verify-dicom",
+  "title": "kadd verify-dicom",
+  "code_file": "verify_dicom_kernel.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": false,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": ["pieteroehlers/kadd-package"],
+  "competition_sources": ["rsna-knee-abnormality-detection"],
+  "kernel_sources": []
+}

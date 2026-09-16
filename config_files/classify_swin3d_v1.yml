@@ -1,0 +1,45 @@
+name: classify_swin3d_v1
+
+classify:
+  model:
+    type: swin3d          # swin3d (ViT) | cnn3d
+    size: light            # xlight | light | medium | large — see model.py
+    pretrained: false      # Kinetics-400 weights; only reuses deeper blocks, see model.py docstring
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+    proj_dropout: 0.1
+
+  data:
+    data_path: data/train_series/       # bulk DICOM tree: <StudyInstanceUID>/<SeriesInstanceUID>/*.dcm
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: true        # v1 default: train only on the 58 directly-labeled studies
+    max_series: 8           # cap on series/study fed to attention-MIL pooling (max seen locally: 14)
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 100
+    batch_size: 2           # 1 study/GPU if 2 GPUs are visible (see train.py's multi-GPU
+                             #   study-sharding docstring) — was 1 (single-GPU OOM fix, still
+                             #   correct at batch_size=1, just leaves a 2nd GPU idle if present).
+                             #   With only 1 GPU visible, this instead doubles the per-step
+                             #   memory footprint vs. the batch_size=1 fix — if that OOMs again
+                             #   on a single-GPU kernel, drop this back to 1.
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 4
+    grad_clip: 1.0
+    patience: 20

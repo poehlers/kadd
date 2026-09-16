@@ -1,0 +1,174 @@
+name: classify_swin3d_medium
+# swin3d (ViT) encoder, size=medium (torchvision's swin3d_s — same embed_dim as
+# 'light' but stage-3 depth 6->18 blocks). Per-block activation width matches
+# 'light' (both embed_dim=96) and every block is already gradient-checkpointed,
+# so this starts from the SAME batch_size/max_series as light rather than
+# scaling down blind — the extra depth mainly costs more optimizer-state memory
+# (params 27.9M -> 49.5M) which is small relative to a 16GB/GPU budget.
+#
+# REAL TRAINING CONFIG as of 2026-08-29, promoted from resource probing per
+# feedback_resource_probing_process:
+#   1. 3-epoch probe (pretrained=false, batch_size=2/max_series=8,
+#      sub_epoch_size=300): GPU 0/1 reserved=12.40GB/10.52GB of 15.64GB
+#      (79.3%/67.3% real reserved fraction).
+#   2. Tried batch_size=4: OOM'd almost immediately (GPU 1: 13.67GB in use,
+#      only 908MB free) — same hard-ceiling signature as swin3d/light's
+#      max_series=14 failure. Reverted to batch_size=2.
+#   3. 20-epoch stress test at batch_size=2 (still pretrained=false): clean,
+#      no OOM, but peak reserved on GPU 1 crept to 13.92GB (89.0%) on a
+#      different random draw than the first probe saw — confirms a 3-epoch
+#      reading alone isn't reliable, worth the extra epochs.
+#   4. From-scratch (pretrained=false) showed no real learning trend over
+#      those 20 epochs (macro_auc flat ~0.53-0.57) — same wall swin3d/light
+#      hit; ViTs lack CNN's translation-equivariance inductive bias, so they
+#      need pretrained weights or far more data to escape near-chance.
+#   5. 3-epoch probe with pretrained=true (same batch_size/max_series): also
+#      clean, no OOM — reserved actually came in a bit LOWER this time
+#      (78.8%/76.0%) than the non-pretrained stress test's worst case
+#      (89.0%). Real risk accepted knowingly here: this pretrained
+#      configuration was only checked for 3 epochs, not stress-tested to 20
+#      like the non-pretrained case was — given step 3's own lesson, a worse
+#      random draw later in a 100-epoch run remains a real, accepted
+#      possibility, not a ruled-out one.
+# use_checkpointing stays true unconditionally — confirmed load-bearing for
+# swin3d memory on the light tier (disabling it OOM'd immediately even with
+# apparent headroom, see classify_swin3d_light.yml's history).
+#
+# patience/scheduler_params.patience cut well below the other tiers'
+# defaults (20/10 -> 8/4, ratio preserved so an LR anneal is still
+# guaranteed to fire and get evaluated before giving up): real epoch time
+# at sub_epoch_size=300 was ~440s for 150 steps (~2.9s/step); the full
+# ~4,349-study dataset is ~2,175 steps/epoch, projecting to roughly
+# ~105 minutes/epoch. At the original patience=20 that would allow up to
+# ~35 hours of continued training after the last improvement before
+# stopping — the steeper 8/4 pair caps that worst case at roughly 14 hours.
+# This ~105 min/epoch estimate predates the SDPA/FlashAttention patch (see
+# classify_swin3d_light.yml's history, 2026-09-09) — that patch applies
+# automatically to EVERY swin3d encoder (kadd/classify/attention_patch.py is
+# invoked unconditionally in Swin3DSeriesEncoder.__init__, no config flag),
+# so this tier gets its ~1.5x speedup for free on the next run without any
+# change here. Real epoch time for this specific tier is still unmeasured
+# post-patch though — treat ~105min as a stale upper bound, not a current
+# estimate, until a real log confirms the actual number.
+#
+# unfreeze_last=3/encoder_lr_mult=0.3 ADDED 2026-09-12, ported from
+# classify_swin3d_light.yml's confirmed-working settings (kernel v62-v68,
+# best macro-AUC 0.6929) — same competitive-research-derived idea (freeze
+# only the earliest, most generic pretrained layers; give the rest a lower
+# but real LR to adapt to this project's laterality-normalized/physical-
+# cropped inputs). Verified by direct introspection this is a like-for-like
+# port, not a guess: swin3d_s's (this tier) 7 top-level feature stages have
+# a very different per-stage size distribution than swin3d_t's (light) —
+# stage 4 alone is 65.6% of this tier's encoder (32.5M params, since this
+# tier's stage-3 depth is 18 blocks vs light's 6) vs light's 38.9% — but
+# `unfreeze_last=3` still lands on the same relative outcome for both:
+# ~96.9% of this tier's encoder ends up trainable (stages 4/5/6 =
+# 32.49M+1.18M+14.3M of 49.5M total) vs light's ~94.5% — freezing only the
+# same small, early, generic ~3.1% (stages 0-3, 1.53M params) in both
+# cases. Not yet run — this is the FIRST time this tier's config has used
+# the fixed data pipeline (laterality norm/crop_mm, both automatic via the
+# shared kadd/classify/data.py defaults — no explicit crop_mm needed here)
+# combined with partial fine-tuning; no resume_from is set for this first
+# run since light's checkpoint has an incompatible architecture (different
+# stage-3 depth) — this starts fresh from pretrained Kinetics-400 weights,
+# same as light's first real run on the fixed pipeline did.
+
+classify:
+  model:
+    type: swin3d
+    size: medium             # xlight | light | medium | large
+    pretrained: true          # Required for real learning — see file header steps 4-5.
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true   # REVERTED 2026-09-12 — the false experiment (kernel v70) was tried, per the
+                              #   real epoch-1 headroom kernel v69 showed (47%/38% reserved with
+                              #   checkpointing ON) — and it genuinely OOM'd, confirming the risk this
+                              #   comment already flagged rather than being a guaranteed transfer from
+                              #   light. Real traceback: `torch.OutOfMemoryError: CUDA out of memory. Tried
+                              #   to allocate 114.00 MiB. GPU 0 has a total capacity of 14.56 GiB of which
+                              #   46.81 MiB is free` — inside the SDPA-patched attention call, ~9 minutes
+                              #   into epoch 1 (548s), well past initial setup, so this is real steady-state
+                              #   memory pressure building up, not a one-off startup spike. Root cause:
+                              #   medium's stage 2 (features[4]) is 32.5M params / 18 transformer blocks —
+                              #   roughly 3x light's stage 2 (10.8M params / 6 blocks) — and with
+                              #   unfreeze_last=3 that entire stage is trainable, so backward needs real
+                              #   activations for all 18 blocks' worth of that stage without checkpointing's
+                              #   recompute-instead-of-store tradeoff. The ~47%/38% reserved reading at
+                              #   checkpointing=ON was itself evidence checkpointing was already doing real
+                              #   work here (keeping usage that low despite a much bigger trainable stage
+                              #   than light's), not evidence there was slack to remove it. Lesson recorded:
+                              #   low reserved memory WITH checkpointing on does not imply safety WITHOUT
+                              #   it — checkpointing's own savings scale with how much is being checkpointed,
+                              #   and this tier checkpoints substantially more (the whole 18-block stage) than
+                              #   light did (a 6-block stage). Not retrying this without a real compensating
+                              #   change first (e.g. reduced max_series/batch_size tested in isolation).
+    proj_dropout: 0.1
+    unfreeze_last: 3          # ADDED 2026-09-12 — see file header for the full introspection-verified
+                              #   reasoning (ported from light's confirmed-working setting).
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    sub_epoch_size: false           # full dataset every epoch for the real run — see file header.
+    precomputed_dir: data/precomputed
+    max_series: 8                   # confirmed-safe ceiling for this tier — see file header.
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 100                # real run — early stopping (patience below) decides when it's done.
+    resume_from: data/resume_checkpoint_medium.pth  # UPDATED 2026-09-14: kernel v73 (batch_size=4, resumed
+                                 #   from epoch 11's 0.7161) ran 10 more epochs (12->21) — new best macro-AUC
+                                 #   **0.7208 at epoch 18**, the best swin3d result in this project so far.
+                                 #   No improvement in epochs 19-21 (0.7171/0.7180/0.7196); user stopped the
+                                 #   run there rather than let it burn the last of a nearly-exhausted weekly
+                                 #   quota chasing early-stopping's full patience=8 window. best.pth (0.7208)
+                                 #   copied here. Prior 2026-09-13 entry (kernel v72, epoch 1->11, 0.5677->
+                                 #   0.7161, climbing every epoch) is what motivated the batch_size 2->4 test
+                                 #   — see that config's own comment above for the confirmed result. Original
+                                 #   2026-09-12 reasoning still accurate: separate file from light's
+                                 #   data/resume_checkpoint.pth (incompatible architectures, different
+                                 #   stage-3 depth means different parameter shapes) — requires
+                                 #   scripts/kaggle_push_dataset.py's EXTRA_FILES to include this filename
+                                 #   (already added). Quota was down to 3.76h as of this run ending (resets
+                                 #   2026-09-19) — no further pushes this session.
+    batch_size: 4                # CONFIRMED GOOD, 2026-09-13/14 — raised 2->4 given kernel v72's repeated
+                                 #   36%/30%-reserved headroom (see resume_from comment above). Real result,
+                                 #   kernel v73 (10 more epochs, 12->21, resumed from epoch 11's 0.7161):
+                                 #   genuinely FASTER (~3800-3960s/epoch GPU compute vs. batch_size=2's
+                                 #   ~4020-4249s, ~6-10%) AND reached a BETTER result — new best macro-AUC
+                                 #   0.7208 at epoch 18, up from 0.7161. Unlike light's own batch_size 4->8
+                                 #   experiment (2026-09-09), which got slower despite more headroom, this
+                                 #   one is a genuine win on both axes — not assumed, watched for exactly
+                                 #   this outcome per the project's own probing discipline. Real memory at
+                                 #   batch_size=4: GPU 0/1 reserved=13.86GB/10.72GB (64%/58%) — solid margin,
+                                 #   not near the ceiling; room for another cautious step later if desired,
+                                 #   but not pushed further this session (quota nearly exhausted, 3.76h
+                                 #   remaining as of the last check, resets 2026-09-19).
+    lr: 1.0e-5
+    encoder_lr_mult: 0.3      # ADDED 2026-09-12 — see file header for reasoning (ported from light's
+                              #   confirmed-working setting). Splits the optimizer into 2 param groups:
+                              #   encoder at lr*0.3=3e-6, everything else (meta_embed/pool/head) at the
+                              #   full lr=1e-5.
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 4               # 10->4 — see file header's epoch-time math.
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 4
+    grad_clip: 1.0
+    patience: 8                 # 20->8 — see file header's epoch-time math. Ratio to scheduler
+                                 #   patience (2:1) kept the same as the other tiers' defaults, so an
+                                 #   LR anneal is still guaranteed to fire and get evaluated before
+                                 #   early-stopping gives up.

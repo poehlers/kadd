@@ -1,0 +1,217 @@
+name: classify_cnn3d_xlight
+# cnn3d encoder (ported from DenPIE's ConvNet3DDensity), size=xlight — see
+# kadd/classify/model.py CNN3D_CHANNELS. No pretrained-weights option exists
+# for this family (DenPIE's version doesn't have one either). Same data setup
+# as the swin3d v2/light config (silver labels, gold held out as val).
+#
+# batch_size/max_series below are MEASURED, not guessed — two real Kaggle
+# runs so far (2026-08-15, both sub_epoch_size=300, both ~6.3min/epoch):
+#   batch_size=4,  max_series=10: peak_allocated 0.79/0.62GB, reserved
+#     2.06/1.55GB of 15.64GB per T4 (5%/4%)
+#   batch_size=16, max_series=14: peak_allocated 2.82/1.89GB, reserved
+#     7.30/5.32GB of 15.64GB per T4 (18%/12%) — memory scaled roughly
+#     linearly with the 4x batch_size increase (~3.5x), as expected
+# Epoch time barely changed between these two runs despite the 4x batch_size
+# jump — read as "CPU-side DICOM decode is probably the epoch-time
+# bottleneck, not GPU compute" in this session, but that was an INFERENCE,
+# not a measurement, and got correctly challenged as such. train.py added an
+# explicit per-epoch data-wait-vs-GPU-compute time split
+# (_log_data_vs_compute_time) plus CPU utilization (_log_cpu_usage) to answer
+# it for real. max_series is now at 14, the actual max series/study observed
+# anywhere in this project — no further headroom to gain there. Still well
+# under capacity at batch_size=16; raised further to 32 (user override,
+# going straight to 32 rather than a more conservative step first).
+# gradient_accumulation_steps stays at 1 (effective batch grows with
+# batch_size, not held constant).
+#
+# batch_size=32, max_series=14 run (2026-08-15) — the actual measurement:
+#   GPU: 30%/22% of 15.64GB per T4
+#   Data loading: 297.9s  GPU compute: 10.8s  (96% of step time on data)
+#   CPU: 44% avg across 4 logical cores (num_workers=4, == core count)
+# Confirms genuinely data-bound (96%) — but CPU at only 44% despite
+# num_workers already matching the core count is the important detail: if
+# this were CPU-bound decode work, workers would be near 100%. Instead it
+# points at I/O latency (reading from Kaggle's mounted competition storage)
+# — workers spend time blocked on file reads, not computing. That means
+# MORE workers than physical cores can genuinely help here (idle-on-I/O
+# workers don't compete for CPU), which wouldn't be true for a CPU-bound
+# workload. num_workers raised 4->16 (4x oversubscription) and
+# prefetch_factor added at 4 (up from PyTorch's default 2, per-worker queue
+# depth) to smooth over I/O latency spikes with more reads in flight at
+# once. Unverified past this reasoning — read the next run's
+# _log_data_vs_compute_time/_log_cpu_usage to confirm this actually helped
+# before pushing further; if CPU jumps toward 100% with these workers, the
+# bottleneck shape may have shifted back toward CPU-bound and this logic
+# needs revisiting.
+#
+# NOTE: the other 7 tiered configs' batch_size/max_series/num_workers remain
+# unverified guesses — this measurement is cnn3d/xlight-specific and should
+# NOT be extrapolated to swin3d or to larger cnn3d tiers, which have
+# meaningfully different per-volume memory footprints even at the same
+# batch_size (though the I/O-latency finding itself may generalize, since
+# it's about the Kaggle mount, not the model — still unconfirmed for others).
+#
+# GPU 0 vs GPU 1 asymmetry (real, structural, not incidental): GPU 0 is
+# device_ids[0], the "primary" device in the multi-GPU study-sharding —
+# it holds the un-replicated original model AND is where every shard's
+# output gets gathered back to (`logits.to(primary)` in
+# _forward_multi_gpu). GPU 0 will always run hotter than GPU 1 in this
+# architecture; it's the real ceiling to watch, GPU 1's number is not
+# representative. Also: the logged "% of capacity" uses peak_allocated, but
+# `reserved` (what PyTorch's caching allocator actually holds onto, and
+# what determines real OOM risk) is a tighter number — at batch_size=32,
+# GPU 0 was already at reserved=9.28/15.64GB = 59%, not the 30% the logged
+# percentage suggests. The 16->32 batch_size step also grew reserved memory
+# SUBLINEARLY versus the earlier 4->16 step, so a clean linear
+# extrapolation from here is no longer trustworthy. Given this config needs
+# to eventually hold up unattended at full-dataset sub_epoch_size, raised
+# batch_size more moderately this round: 32->48 (1.5x, not another
+# doubling), targeting roughly reserved~11-12GB (~70-75%) on GPU 0 while
+# keeping real margin.
+#
+# sub_epoch_size independence (important for scaling toward the full dataset):
+# every training step only ever processes batch_size studies (each capped
+# at max_series series) regardless of how large the underlying epoch's
+# dataset is. Growing sub_epoch_size from 300 toward the full ~4,349 studies
+# only adds MORE STEPS per epoch (longer wall-clock — an I/O/throughput
+# question, see the num_workers/prefetch_factor note above), not bigger
+# steps — so this batch_size/max_series GPU tuning, once dialed in, carries
+# over directly to larger sub_epoch_size / the full dataset without needing to
+# be re-verified at each step up. GPU tuning and sub_epoch_size tuning are
+# orthogonal.
+#
+# num_workers=16/prefetch_factor=4 run (2026-08-15) — OOM-KILLED by the
+# HOST OS, not GPU. Epoch 1 completed fine (data-wait dropped 297.9s->202.9s,
+# a real ~32% improvement from the oversubscription; CPU rose 44%->55%,
+# consistent with more workers doing more concurrent I/O — the diagnosis
+# was directionally right). But the run died with a bare "Killed" (the
+# Linux OOM-killer's signature, not a Python exception) right as epoch 2's
+# DataLoader started spinning up. GPU memory was fine (44%/32%) — this was
+# HOST RAM, which was never being watched (only _log_gpu_memory existed).
+# Root cause: sub_epoch_size subsampling rebuilds a fresh DataLoader every
+# epoch (see _make_train_loader), but that loader still had
+# persistent_workers=True — pointless for a loader used for exactly one
+# epoch, and actively risky: persistent workers only shut down when the
+# loader object is garbage collected, so the outgoing epoch's ~16 workers
+# could still be alive at the exact moment the incoming epoch's ~16
+# workers spawn, right at this boundary. Fixed properly in
+# kadd/classify/train.py (_make_train_loader now passes
+# persistent_workers=False for the per-epoch subsampled loader), and added
+# _log_host_memory (psutil.virtual_memory) so this class of failure is
+# visible next time instead of a silent kill. Also backed off num_workers
+# 16->8 and prefetch_factor 4->2 here — the persistent_workers fix addresses
+# the epoch-boundary transient spike specifically, but STEADY-STATE RAM
+# during a single epoch (worker_count x prefetch_factor decoded volumes
+# queued at once) was also unmeasured and worth reducing until a real
+# _log_host_memory reading confirms there's headroom to raise it again.
+# batch_size/max_series are untouched — GPU was never the problem here.
+#
+# num_workers=8/prefetch_factor=2/persistent_workers=False run (2026-08-15)
+# — STILL OOM-KILLED, same epoch-boundary pattern. The persistent_workers
+# fix was necessary but not sufficient — the deeper problem was rebuilding
+# the DataLoader (and its whole worker pool) every single epoch AT ALL, not
+# just how "safely" that rebuild was configured. Same run also surfaced a
+# second real risk: GPU 0 reserved hit 15.22/15.64GB = 97% at batch_size=48
+# (raised the previous round) — far closer to a real CUDA OOM than the
+# earlier linear extrapolation suggested; reserved-memory scaling clearly
+# isn't predictable near capacity. Two fixes:
+#   1. Architectural fix in kadd/classify/train.py: _make_train_loader now
+#      builds the DataLoader ONCE for the whole run, even with sub_epoch_size
+#      subsampling active — a custom sampler (_EpochSubsetSampler) draws a
+#      fresh random subset every time the DataLoader is iterated, so a new
+#      subset happens every epoch WITHOUT ever rebuilding the loader or
+#      spawning a new worker pool. This eliminates the failure mode
+#      entirely instead of trying to make the rebuild safer.
+#   2. batch_size rolled BACK 48->32 (the last confirmed-safe point,
+#      reserved=59% on GPU 0) given how close 48 actually came to a real
+#      GPU OOM. Not raising it again until several epochs run cleanly at 32
+#      with the new sampler-based loader.
+# num_workers/prefetch_factor left at 8/2 (unverified whether they were
+# ever really the problem, versus the rebuild-every-epoch design) — revisit
+# from _log_host_memory/_log_cpu_usage readings once the architectural fix
+# is confirmed stable, rather than changing multiple things at once again.
+#
+# Architectural fix run (2026-08-15) — STILL OOM-killed, but the crash
+# pattern changed in a way that confirms real progress: this time it died
+# mid-epoch-1 (no "Epoch 1/100" line at all), NOT at an epoch boundary — the
+# rebuild-per-epoch bug is genuinely fixed (only one worker-spawn event in
+# the whole log, versus two before). The remaining problem is simpler:
+# train_loop now builds BOTH the train and val DataLoaders once at the start
+# and keeps them alive (persistent_workers=True) for the ENTIRE run, so
+# their worker counts add as steady-state pressure the whole time, not just
+# transiently — 8 (train) + 8 (val, same num_workers by default) = 16
+# persistent workers alive simultaneously. Fixed: kadd/classify/train.py's
+# _make_loader gained a num_workers override param, and train_loop now
+# builds the val loader with a much smaller val_num_workers (default 2, see
+# below) — val is only 58 gold studies and runs once per epoch, it never
+# needed 8-way I/O parallelism. This cuts steady-state total workers 16->10
+# without touching train's I/O parallelism at all. One variable changed,
+# same discipline as every step in this log — read the next run's
+# _log_host_memory to see if this was enough on its own.
+#
+# val_num_workers=2 run (2026-08-15) — REAL PROGRESS, still OOM-killed but
+# later and differently: epoch 1 completed cleanly this time (macro_auc
+# logged, best.pth checkpoint saved) and it survived the epoch 1->2
+# boundary. Host RAM at epoch 1's end: 14.44GB used / 33.66GB total (84%),
+# only 5.25GB available — genuinely tight. Killed ~136s into epoch 2, once
+# that epoch's normal prefetch activity added to an already-84%-full
+# baseline. Confirms num_workers=8 (train) is still too much steady-state
+# RAM even with val's workers already cut down. User called it: dropped
+# num_workers 8->4 — matches the kernel's actual 4 physical cores, no
+# oversubscription at all now. This sacrifices the I/O-latency-oversubscription
+# benefit from earlier in this log (which DID measurably help: data-wait
+# time dropped when workers went 4->16 originally) in favor of not getting
+# killed — a real tradeoff, not a free win. If 4 still isn't enough, the
+# next lever is prefetch_factor (already at PyTorch's default, 2) or
+# accepting slower-but-stable epochs at this worker count.
+
+classify:
+  model:
+    type: cnn3d
+    size: xlight              # xlight | light | medium | large
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    sub_epoch_size: 300               # subsample this many studies/epoch (redrawn each epoch) instead of
+                                   #   all ~4,349 — real per-study DICOM load time is unmeasured
+                                   #   beyond the diagnostic's bare-load 0.67s/3d-image (windowing/
+                                   #   crop/resize add more); tune this once a real epoch completes
+                                   #   and its wall-clock is known. See kadd/classify/train.py
+                                   #   _make_train_loader and CLAUDE.md sec 9.
+    max_series: 14             # raised from 10 — the real observed max series/study (was capping some studies)
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4               # backed off from 8 (user override) — matches the kernel's actual 4 physical
+                                  #   cores, no oversubscription; see note above (host RAM was at 84% used /
+                                  #   5.25GB available even with val_num_workers already reduced)
+    val_num_workers: 2          # val is small (58 studies) and persistent for the whole run now — see note above
+    prefetch_factor: 2          # backed off from 4 — PyTorch's default, see note above
+
+  train:
+    epochs: 100
+    batch_size: 32              # rolled BACK from 48 — that run measured GPU 0 reserved=97% (15.22/15.64GB),
+                                  #   far closer to a real OOM than expected; reserved-memory scaling near
+                                  #   capacity is not predictable, see note above
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 1   # dropped from 2 — effective batch 8->16, see note above
+    grad_clip: 1.0
+    patience: 20

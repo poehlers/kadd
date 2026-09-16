@@ -1,0 +1,250 @@
+name: classify_swin3d_light
+# swin3d (ViT) encoder, size=light (torchvision's swin3d_t), ~27.9M params vs
+# cnn3d/light's ~1.2M — the direct architecture comparison against
+# cnn3d/light's real result (kernel v29: 56 epochs, best macro-AUC 0.7095 —
+# see CLAUDE.md sec 7).
+#
+# REAL TRAINING CONFIG as of 2026-09-02, promoted from resource probing per
+# feedback_resource_probing_process:
+#   1. batch_size=2/max_series=8/checkpointing=true, full dataset (kernel
+#      v31): ~62 min/epoch, GPU 0/1 reserved=12.19GB/9.81GB of 15.64GB
+#      (78%/63%). From-scratch (pretrained=false) plateaued near chance over
+#      14 epochs at sub_epoch_size=300 (kernel v33) — too little data
+#      exposure for a ViT with no translation-equivariance bias. Fixed by
+#      pretrained=true (Kinetics-400 weights) — legal under competition
+#      rules (CLAUDE.md sec 1).
+#   2. pretrained=true pushed the SAME batch_size=2/max_series=8 to
+#      89.1%/88.2% reserved (kernel v34) — tighter than any cnn3d tier ever
+#      got. checkpointing-off (the obvious speed lever) OOM'd immediately at
+#      that baseline (kernel v32/v34-era).
+#   3. Cutting max_series 8->5 (median series/study is 5, mean 5.53) freed
+#      real headroom: 48.3%/39.8% reserved (kernel v48) — confirms
+#      max_series, not batch_size, was the dominant memory driver.
+#   4. Retried checkpointing-off with that freed headroom: OOM'd again, even
+#      faster (~79s, kernel v49) — checkpointing's real memory savings
+#      exceed what a moderate max_series cut can compensate for. Ruled out
+#      as a lever entirely for this architecture.
+#   5. Tried batch_size=4 instead (2 studies/GPU, halves step count) at
+#      max_series=5: safe (kernel v50, 3 epochs; kernel v51, 20-epoch
+#      stress test) — GPU 0/1 reserved=12.56GB/12.31GB (80.3%/78.7%), IDENTICAL
+#      every single epoch across 20 varied random draws, zero drift, zero OOM.
+#      Real epoch time ~230s at sub_epoch_size=300, projecting to ~55-56
+#      min/epoch on the full dataset (down from ~62 min — modest but real,
+#      plus a much safer memory margin than the max_series=8 baseline had).
+#      macro_auc even showed a real upward trend during the stress test
+#      itself (0.4963->0.5951) despite the data-starved sub_epoch_size=300
+#      setting.
+# use_checkpointing stays true unconditionally — confirmed load-bearing,
+# ruled out twice (steps 2 and 4 above; a 3rd confirmation, 2026-09-02:
+# checkpointing-off OOM'd even at batch_size=2/max_series=5 freed headroom,
+# kernel v49, faster than any other checkpointing-off attempt — not a
+# batch_size interaction, ruled out entirely for this architecture).
+#
+# 2026-09-02 real-run result (kernel v54, sub_epoch_size=false/full dataset,
+# max_series=5, batch_size=4): killed by kaggle_push_kernel.py's own -t 36000
+# (10h) wall-clock timeout at epoch 11 (not OOM, not a manual cancel — the
+# push script's own safety cap, confirmed by push-time vs kill-time matching
+# to the minute). Real progress before the kill: macro_auc climbed every
+# improving epoch, 0.5112 (epoch 1) -> 0.6819 (epoch 11), ~50 min/epoch. Every
+# epoch's own log showed the real bottleneck: "Data loading: 1.2-1.7s  GPU
+# compute: ~3000s (0% of step time spent waiting on data)" — unlike cnn3d,
+# swin3d is genuinely GPU-COMPUTE-bound (real forward+backward time, doubled
+# by checkpointing's recompute), not I/O-bound.
+#
+# 2026-09-03 DETOUR AND CORRECTION (kernel v55-v57) — recorded so this
+# mistake isn't repeated: tried "fixing" the above by re-enabling
+# sub_epoch_size=300 and framed it as "~11x faster." That framing was WRONG
+# — it compared wall-clock across two different epoch sizes (300 studies vs
+# 4,349), not a real throughput improvement. Since this architecture is
+# GPU-compute-bound, total compute per unit of DATA is fixed regardless of
+# how it's chunked into epochs — normalizing v57's ~280s/300-study-epoch to
+# a full-dataset-equivalent pass gives ~67.6 min, actually SLOWER than v54's
+# ~50-56 min (batch_size dropped 4->2 along the way for an unrelated OOM
+# fix, losing GPU parallelism). Real consequence: kernel v57 flatlined near
+# chance (macro_auc 0.49-0.52) and early-stopped at epoch 11 — not because
+# the model couldn't learn, but because patience=8/scheduler_patience=4
+# were calibrated for the OLD meaning of "epoch" (a full pass) and gave up
+# after only ~14.5x less real data exposure than they were tuned for.
+# sub_epoch_size does NOT fix a compute-bound bottleneck — it only changes
+# how much data is touched between checkpoints, trading epoch-count
+# granularity for noisier signal. REVERTED to sub_epoch_size=false,
+# batch_size=4, max_series=5 below — the exact v54 config, which was
+# already producing clean, monotonic real learning and was never actually
+# broken. The ONLY real fix needed is a longer kernel --timeout (Kaggle's
+# actual session limit is 12h — see scripts/kaggle_push_kernel.py; this run
+# should be pushed with something like --timeout 41400, i.e. 11.5h, instead
+# of the script's conservative 10h default) so it isn't cut off again while
+# still improving.
+
+classify:
+  model:
+    type: swin3d
+    size: light              # xlight | light | medium | large
+    pretrained: true          # Required for real learning — see file header step 1.
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: false       # TRYING OFF, 2026-09-09 — ruled out 3x before (kernel v32/v34/v49-era,
+                                     #   see file header) as a speed lever, but ALL 3 of those attempts
+                                     #   predate the SDPA/FlashAttention patch (kadd/classify/attention_patch.py,
+                                     #   2026-09-09), which cut real GPU memory usage roughly in half (GPU 0/1
+                                     #   reserved 72%/68% -> ~40-53%/36-50% at batch_size=4-8, confirmed on
+                                     #   real Kaggle hardware, kernel v64/v65). That's a fundamentally different
+                                     #   memory landscape than every prior checkpointing-off attempt, so this is
+                                     #   a genuine new experiment, not repeating a settled question — but real
+                                     #   OOM risk given the 3x prior track record, not a guaranteed win. If this
+                                     #   OOMs, revert to true immediately, no further probing needed — the
+                                     #   pre-SDPA-patch attempts already established checkpointing is load-
+                                     #   bearing at LOWER memory pressure than this, so a 4th failure here would
+                                     #   just reconfirm that finding under a smaller headroom margin, not reveal
+                                     #   anything new.
+    proj_dropout: 0.1
+    unfreeze_last: 3                # RAISED 1->3, 2026-09-08 — see file header's "swin3d/light performed
+                                     #   worse" entry. unfreeze_last=1/encoder_lr_mult=0.1 (added 2026-09-04,
+                                     #   adapted from a public 0.809-scoring reference solution) were run for
+                                     #   the first time ever on 2026-09-07's fresh full run (kernel v61) and
+                                     #   produced a near-flat trn_loss (1.0892->1.0867 over 5 epochs) and
+                                     #   chance-level macro_auc — a much weaker result than v54's full-
+                                     #   fine-tune run (0.51->0.68 over 11 epochs, no unfreeze_last/
+                                     #   encoder_lr_mult at all). Leading hypothesis: 6/7 stages frozen +
+                                     #   10x-reduced encoder LR was too conservative to let the model adapt
+                                     #   to the SAME run's other change (crop_mm physical crop + laterality
+                                     #   normalization on the precomputed inputs — neither existed during
+                                     #   Kinetics-400 pretraining OR during v54's successful run). 3 unfreezes
+                                     #   the last 3 of 7 stages (per-stage param counts confirmed via direct
+                                     #   introspection — the last two stages alone hold ~90% of the encoder,
+                                     #   so this covers nearly all of the model's real capacity while still
+                                     #   protecting only the earliest, most generic patch-level filters).
+                                     #   patch_embed.proj (freshly reinitialized for 1-channel input) and the
+                                     #   head stay trainable regardless — see Swin3DSeriesEncoder's own
+                                     #   unfreeze_last handling. See classify.train.encoder_lr_mult below for
+                                     #   the paired LR change.
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    crop_mm: 130.0                  # ADDED 2026-09-04, same reference solution: center-crop the H/W spatial
+                                     #   dims to a fixed real-world 130mm extent (via PixelSpacing) BEFORE the
+                                     #   resize to target_size, so a 1-3mm meniscal tear doesn't get destroyed
+                                     #   by a blind resize on a scanner with an unusually large raw field of
+                                     #   view. Also enables laterality normalization (no separate flag —
+                                     #   automatic whenever Anatomical_Plane is available, see
+                                     #   kadd/classify/data.py's _normalize_laterality) — canonicalizes every
+                                     #   knee to a left-knee convention, since medial/lateral is otherwise
+                                     #   ambiguous between left/right studies and directly affects 5 of the 12
+                                     #   labels (both menisci, both OA compartments, MCL). NEITHER of these
+                                     #   apply retroactively to the existing precomputed cache (precomputed
+                                     #   volumes were decoded before this change) — regenerating the precompute
+                                     #   dataset is required before a real run actually benefits from this;
+                                     #   see kaggle_kernel_precompute/precompute_kernel.py, updated in step but
+                                     #   not yet re-run.
+    sub_epoch_size: false           # REVERTED to false (full dataset), 2026-09-03 — see file header's
+                                    #   "DETOUR AND CORRECTION": sub_epoch_size doesn't fix a compute-bound
+                                    #   bottleneck, it just chunks the same total compute into noisier epochs.
+                                    #   The real fix for the 10h timeout cutoff is a longer --timeout on push.
+    precomputed_dir: data/precomputed
+    max_series: 5                   # REVERTED 8->5, 2026-09-03 — back to the exact v34/v54 combo
+                                    #   (batch_size=4/max_series=5) that was already producing clean, real
+                                    #   learning (0.51->0.68 over 11 epochs) with a safe memory margin
+                                    #   (80.3%/78.7% reserved) and better throughput than max_series=8 gave.
+                                    #   The val macro-AUC noise concern below is real in theory, but v54's
+                                    #   actual result (monotonic improvement every single epoch) shows it
+                                    #   wasn't practically hurting this run — not worth trading throughput/
+                                    #   margin for.
+                                    #
+                                    # Original reasoning for the 3->5 revert (still accurate background on
+                                    #   WHY val noise matters here in general, even though the exact number
+                                    #   has moved since):
+                                    #   val_ds is built with the SAME max_series cap as train_ds (both via the
+                                    #   shared `common` kwargs, see KneeDataLoader.load — data.py:482-486), and
+                                    #   KneeDataset.__getitem__ re-randomizes which series get sampled on every
+                                    #   call — including every validation pass. At max_series=3 this meant the
+                                    #   macro-AUC used for best-checkpoint selection and early-stopping would be
+                                    #   computed from a fresh random 3-of-N series subset each epoch for each of
+                                    #   the 58 gold val studies — adding real sampling noise on top of the
+                                    #   already-flagged macro-AUC degeneracy at N=58, and undermining the
+                                    #   apples-to-apples comparison with cnn3d/light (trained at max_series=14,
+                                    #   effectively uncapped).
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 100                # real run — early stopping (patience below) decides when it's done.
+    resume_from: data/resume_checkpoint.pth  # UPDATED 2026-09-09/12: kernel v68 (checkpointing OFF, SDPA
+                                 #   patch active, resumed from v64's 0.6817) ran to a NATURAL EARLY STOP —
+                                 #   "Early stopping at epoch 27 (patience=8)", best macro-AUC 0.6929 at
+                                 #   epoch 19, 5h12m total. Not a crash/cancel/timeout — this run genuinely
+                                 #   converged at this unfreeze_last=3/encoder_lr_mult=0.3/lr=1e-5 setting on
+                                 #   the current data. data/resume_checkpoint.pth updated to epoch 19's
+                                 #   best.pth (0.6929). IMPORTANT: since this converged via early stopping
+                                 #   (not cut off by quota/timeout), a PLAIN resume from here will likely just
+                                 #   immediately re-trigger early stopping again (patience_counter resets to 0
+                                 #   on resume, but the underlying loss landscape hasn't changed) — getting
+                                 #   further improvement needs an actual change (e.g. a lower base `lr`
+                                 #   restart, raising `unfreeze_last` further, or a different tier/config
+                                 #   entirely), not just re-pushing this same config unmodified.
+                                 #   Original 2026-09-08 reasoning, still accurate: kernel v62 (the FIRST run
+                                 #   on the fixed data + unfreeze_last=3/encoder_lr_mult=0.3, started fresh
+                                 #   per the 2026-09-07 decision above) produced real, clean learning — no
+                                 #   data/setting mismatch, so resuming continues real validated progress
+                                 #   rather than risking anything.
+    batch_size: 4                # REVERTED 8->4, 2026-09-09 — the 4->8 bump (same day, see git history/
+                                 #   CLAUDE.md for the full reasoning that motivated it) measured SLOWER, not
+                                 #   faster: kernel v65's epoch 14 took 2137.7s GPU compute vs. v64's
+                                 #   ~1943-1966s at batch_size=4 — a ~9% regression, with GPU reserved memory
+                                 #   actually LOWER at batch_size=8 (6.72GB/6.19GB, 43%/40%) than at
+                                 #   batch_size=4 (8.29GB/7.78GB, 53%/50%), so it wasn't memory-bound at
+                                 #   either size and the slowdown's exact cause is still unexplained — possibly
+                                 #   how the custom multi-GPU study-sharding or windowed-attention batching
+                                 #   interacts with larger batches, not yet investigated further. Reverted to
+                                 #   the confirmed-good value rather than keep an unexplained regression while
+                                 #   testing checkpointing (below) as a single-variable change.
+                                 #   gradient_accumulation_steps halved 4->2 alongside this (see below) to
+                                 #   hold effective batch size constant at 16 — deliberately not changing
+                                 #   optimizer/LR dynamics on an already-improving resumed run at the same
+                                 #   time as a memory-headroom change, to keep this a single-variable step.
+    encoder_lr_mult: 0.3         # RAISED 0.1->0.3, 2026-09-08, PAIRED with unfreeze_last 1->3 above — see
+                                 #   its comment for the full diagnosis (kernel v61's near-flat trn_loss).
+                                 #   0.1 was too conservative for a run that's ALSO adapting to a changed
+                                 #   input distribution (crop_mm/laterality norm) in the same pass — the
+                                 #   encoder's newly-unfrozen stages need a real learning rate to move,
+                                 #   not the head's full lr=1e-5 (risk of destroying pretrained features
+                                 #   too fast) but well above 1e-6 (risk of barely moving at all, which is
+                                 #   what happened). 0.3 -> lr*0.3=3e-6, splits the difference; not yet
+                                 #   empirically re-tuned beyond that, next real signal is whether trn_loss
+                                 #   actually moves in the next run. Splits the optimizer into 2 param
+                                 #   groups (see train.py's _build_param_groups) — encoder at lr*0.3=3e-6,
+                                 #   everything else (meta_embed/pool/head) at the full lr=1e-5.
+                                 #   NOTE: this changes the optimizer's param-group COUNT from 1 (any
+                                 #   checkpoint saved before 2026-09-04) to 2 — load_checkpoint_for_resume
+                                 #   catches and logs past that mismatch rather than crashing (falls back to
+                                 #   a freshly-initialized optimizer, model weights still restore normally).
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 4               # REVERTED to 4, 2026-09-03 — was raised to 30 to compensate for
+                                 #   sub_epoch_size's noise, but sub_epoch_size itself was reverted (see file
+                                 #   header) so the original full-dataset-epoch calibration applies again.
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 4  # REVERTED 2->4, 2026-09-09, paired with the batch_size 8->4 revert
+                                 #   above — keeps effective batch size constant at 16 (4*4 == 8*2).
+    grad_clip: 1.0
+    patience: 8                 # REVERTED to 8, 2026-09-03 — see scheduler_params.patience comment above.
+                                 # Ratio to scheduler patience (2:1) kept the same as the other
+                                 #   tiers, so an LR anneal is still guaranteed to fire and get evaluated
+                                 #   before early-stopping gives up. At ~50-56 min/epoch, patience=8 caps
+                                 #   worst-case continued training after the last improvement at ~7-7.5h —
+                                 #   this is exactly what v54 hit before the SEPARATE 10h push-timeout issue
+                                 #   cut it off; the real fix for that is a longer --timeout on push (see
+                                 #   file header), not shrinking this budget further.

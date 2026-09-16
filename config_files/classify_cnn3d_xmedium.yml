@@ -1,0 +1,69 @@
+name: classify_cnn3d_xmedium
+# cnn3d encoder, size=xmedium (channels 1->32->64->128->256->512, 5 conv
+# blocks — see kadd/classify/model.py CNN3D_CHANNELS). cnn3d-only: no swin3d
+# equivalent exists (swin3d's size vocabulary is constrained to torchvision's
+# canned Swin3D_T/S/B configs + a custom 'xlight'; cnn3d is fully parametric,
+# so it can grow tiers swin3d can't match — see model.py's SIZES/CNN3D_SIZES
+# split, added 2026-08-27 specifically to support this).
+#
+# Same channel PROGRESSION as 'light' (starts at 32, doubles each block) but
+# one block deeper (5 vs 4), reaching medium's final width (512) via a lower,
+# gentler starting point rather than medium's wider-from-the-first-block
+# design ([64,128,256,512]). A genuinely different capacity/compute
+# tradeoff from both light and medium, not simply "between" them.
+#
+# NOT YET RUN on real hardware — this is a probe-ready starting config,
+# intentionally conservative (batch_size=2, sub_epoch_size=300, epochs=3),
+# matching the process established while tuning cnn3d/medium (see the
+# feedback_resource_probing_process memory): probe small and cheap first,
+# read real GPU-reserved-memory (not the logged peak_allocated-based
+# percentage), don't trust linear extrapolation when scaling batch_size up,
+# and stress-test with more epochs before trusting a scaled-up setting for
+# a real 50-100 epoch full run. Wired to the precompute pipeline
+# (precomputed_dir) from the start this time, unlike the original xlight/
+# medium/large templates which predated that fix.
+
+classify:
+  model:
+    type: cnn3d
+    size: xmedium               # xlight | light | medium | xmedium | large
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    sub_epoch_size: 300            # small on purpose during the resource-probe phase — fast iteration,
+                                    #   not a real training signal. See file header.
+    precomputed_dir: data/precomputed
+    max_series: 8                  # conservative starting point for probing — not yet measured for
+                                    #   xmedium's 5-block depth.
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 3                      # PROBE ONLY — terminates on its own after 3 epochs so each resource
+                                    #   measurement round-trip needs no manual cancellation. Set to 100 +
+                                    #   sub_epoch_size: false once tuning is done (see file header).
+    batch_size: 2                  # conservative starting point for probing — see file header.
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 4
+    grad_clip: 1.0
+    patience: 20

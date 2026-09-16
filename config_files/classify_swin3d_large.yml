@@ -1,0 +1,57 @@
+name: classify_swin3d_large
+# swin3d (ViT) encoder, size=large (torchvision's swin3d_b — embed_dim 96->128,
+# same 18-block stage-3 depth as medium). Wider channels than light/medium mean
+# larger per-block activations even with checkpointing, so max_series is trimmed
+# from 8->6 (fewer series pushed through the shared encoder in one forward call)
+# rather than only touching batch_size. Not independently verified on real
+# hardware (no CUDA on the dev machine) — watch the per-epoch GPU memory log
+# (kadd/classify/train.py _log_gpu_memory) on the first real run of this config;
+# this is the tier most likely to need batch_size dropped back to 1 if 32GB
+# combined turns out tighter than expected.
+
+classify:
+  model:
+    type: swin3d
+    size: large              # xlight | light | medium | large
+    pretrained: false         # Kinetics-400 weights; only reuses deeper blocks, see model.py docstring
+    summary_dim: 256
+    meta_dim: 16
+    use_checkpointing: true
+    proj_dropout: 0.1
+
+  data:
+    data_path: data/train_series/
+    labels_csv: data/train.csv
+    series_csv: data/train_series.csv
+    label_columns: [ACL, MCL, "Medial Meniscus", "Lateral Meniscus", "Medial OA",
+                     "Lateral OA", "PF OA", Effusion, Synovitis, "Baker's",
+                     Contusion, Fracture]
+    gold_only: false
+    use_silver_labels: true
+    silver_labels_csv: data/report_labels_llm.csv
+    sub_epoch_size: 300               # subsample this many studies/epoch (redrawn each epoch) instead of
+                                   #   all ~4,349 — real per-study DICOM load time is unmeasured
+                                   #   beyond the diagnostic's bare-load 0.67s/3d-image (windowing/
+                                   #   crop/resize add more); tune this once a real epoch completes
+                                   #   and its wall-clock is known. See kadd/classify/train.py
+                                   #   _make_train_loader and CLAUDE.md sec 9.
+    max_series: 6             # trimmed from 8 — widest encoder in the family
+    target_depth: 32
+    target_size: 224
+    val_split: 0.2
+    num_workers: 4
+
+  train:
+    epochs: 100
+    batch_size: 2              # 1 study/GPU — see tuning note above (most likely tier to need dropping to 1)
+    lr: 1.0e-5
+    optimizer: AdamW
+    weight_decay: 0.01
+    scheduler: ReduceLROnPlateau
+    scheduler_params:
+      factor: 0.3
+      patience: 10
+      min_lr: 1.0e-7
+    gradient_accumulation_steps: 6
+    grad_clip: 1.0
+    patience: 20
